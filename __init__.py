@@ -3,9 +3,9 @@ import logging
 import re
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import STATE_PLAYING
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.event import async_track_state_change_event
-from homeassistant.const import STATE_PLAYING
 
 from .const import (
     CONF_DEFAULT_VOLUME,
@@ -69,19 +69,26 @@ class SonosKnxController:
 
     async def async_start(self):
         # 1. Collecte de toutes les adresses GA valides configurées
-        gas_keys = [
+        single_gas = [
             CONF_GA_VOL_UP,
             CONF_GA_VOL_DOWN,
             CONF_GA_NEXT,
             CONF_GA_PREV,
             CONF_GA_SRC1,
             CONF_GA_SRC2,
-            CONF_GA_STOP,
         ]
         
         gas_to_register = [
-            str(self.data[k]) for k in gas_keys if self.data.get(k)
+            str(self.data[k]) for k in single_gas if self.data.get(k)
         ]
+
+        # Traitement spécifique pour STOP qui peut être une chaîne ou une liste
+        stop_gas = self.data.get(CONF_GA_STOP)
+        if stop_gas:
+            if isinstance(stop_gas, list):
+                gas_to_register.extend([str(ga) for ga in stop_gas if ga])
+            else:
+                gas_to_register.append(str(stop_gas))
 
         # 2. Enregistrement dynamique auprès du composant KNX de Home Assistant
         if gas_to_register:
@@ -116,13 +123,14 @@ class SonosKnxController:
             self._unsub_state = async_track_state_change_event(
                 self.hass, [self.entity_id], self._handle_state_change
             )
+
     @callback
     def _handle_knx_event(self, event: Event):
         data = event.data
         dest = str(data.get("destination", ""))
         payload = data.get("data")
 
-        # Map GA -> (Handler, Name)
+        # Map GA -> (Handler, Name) pour les adresses simples
         ga_map = {
             str(self.data.get(CONF_GA_VOL_UP)): (self._handle_vol_up, "VOL+"),
             str(self.data.get(CONF_GA_VOL_DOWN)): (self._handle_vol_down, "VOL-"),
@@ -130,8 +138,17 @@ class SonosKnxController:
             str(self.data.get(CONF_GA_PREV)): (self._handle_prev, "PREV"),
             str(self.data.get(CONF_GA_SRC1)): (self._handle_src1, "SRC1"),
             str(self.data.get(CONF_GA_SRC2)): (self._handle_src2, "SRC2"),
-            str(self.data.get(CONF_GA_STOP)): (self._handle_stop, "STOP"),
         }
+
+        # Ajout dynamique de la ou des adresses STOP dans la map
+        stop_gas = self.data.get(CONF_GA_STOP)
+        if stop_gas:
+            if isinstance(stop_gas, list):
+                for ga in stop_gas:
+                    if ga:
+                        ga_map[str(ga)] = (self._handle_stop, "STOP")
+            else:
+                ga_map[str(stop_gas)] = (self._handle_stop, "STOP")
 
         if dest in ga_map and ga_map[dest][0]:
             handler, name = ga_map[dest]
@@ -142,39 +159,14 @@ class SonosKnxController:
 
             # Extraction de la valeur (tuple, list ou int/bool)
             val = payload[0] if isinstance(payload, (list, tuple)) else payload
-            if val in (1, True, "1"):
+            if (name == "STOP" and val in (0, False, "0")) or val in (1, True, "1"):
                 self.hass.async_create_task(handler())
+
     async def async_stop(self):
         for unsub in self._unsub_knx:
             unsub()
         if self._unsub_state:
             self._unsub_state()
-
-    def _make_knx_listener(self, target_ga, handler, name):
-        @callback
-        def listener(event: Event):
-            data = event.data
-            dest = data.get("destination")
-            payload = data.get("data")
-
-            # Log de débogage pour voir la structure exacte reçue
-            _LOGGER.debug(
-                "[KNX Event] Dest: %s (cible: %s) | Data: %s (type: %s)",
-                dest, target_ga, payload, type(payload)
-            )
-
-            # Vérification de l'adresse de groupe
-            if str(dest) == str(target_ga):
-                # Extraction de la valeur peu importe si c'est un int, bool ou tuple (ex: (1,))
-                val = payload[0] if isinstance(payload, (list, tuple)) else payload
-                
-                if val in (1, True, "1"):
-                    _LOGGER.info(
-                        "[%s] Télégramme KNX valide reçu sur %s -> Action: %s",
-                        self.entity_id, target_ga, name
-                    )
-                    self.hass.async_create_task(handler())
-        return listener
 
     @callback
     def _handle_state_change(self, event: Event):
@@ -200,21 +192,6 @@ class SonosKnxController:
         state = self.hass.states.get(target)
         return state and state.state == "playing"
 
-    # def _get_other_playing_player(self):
-
-    #     """Trouve la première enceinte (hors nous-mêmes) qui est en cours de lecture."""
-    #     for state in self.hass.states.async_all("media_player"):
-    #         # Exclure notre propre enceinte
-    #         if state.entity_id == self.entity_id:
-    #             continue
-            
-    #         # Vérifier si c'est une enceinte Sonos ou compatible et qu'elle joue
-    #         if state.state == STATE_PLAYING:
-    #             _LOGGER.debug("[%s] Lecteur actif trouvé : %s", self.entity_id, state.entity_id)
-    #             return state.entity_id
-                
-    #     return None
-
     async def _handle_vol_up(self):
         if self._is_playing():
             _LOGGER.info("[%s][vol+] +", self.entity_id)
@@ -237,44 +214,20 @@ class SonosKnxController:
             await self.hass.services.async_call("media_player", "media_next_track", {"entity_id": self.entity_id}, blocking=False)
         else:
             _LOGGER.info("[%s][next] Try to group", self.entity_id)
-            await self._try_to_group()
+            await self._try_group_or_play()
 
     async def _handle_prev(self):
         if self._is_playing():
             _LOGGER.info("[%s][prev] -", self.entity_id)
             await self.hass.services.async_call("media_player", "media_previous_track", {"entity_id": self.entity_id}, blocking=False)
         else:
-            _LOGGER.info("[%s] Try to group", self.entity_id)
-            await self._try_to_group()
-
-    # async def _handle_stop(self):
-    #     try:
-    #       _LOGGER.info("[%s][stop] unjoin", self.entity_id)
-    #       await self.hass.services.async_call("sonos", "unjoin", {"entity_id": self.entity_id}, blocking=False)
-    #     except Exception as err:
-    #       _LOGGER.info("[%s][stop] unjoin error: %s", self.entity_id, err)
-            
-    #     _LOGGER.info("[%s][stop] stop", self.entity_id)
-    #     await self.hass.services.async_call("media_player", "media_stop", {"entity_id": self.entity_id}, blocking=False)
-
-    # async def _try_group_or_play(self):
-    #     other_player = self._get_other_playing_player()
-    #     _LOGGER.info("[%s][try to group] other_player: %s", self.entity_id, other_player)
-    #     if other_player:
-    #         _LOGGER.info("[%s][try to group] join", self.entity_id)
-    #         await self.hass.services.async_call(
-    #             "sonos", "join", {"master": other_player, "entity_id": self.entity_id}, blocking=False
-    #         )
-    #     else:
-    #         _LOGGER.info("[%s][try to group] start alone", self.entity_id)
-    #         await self.hass.services.async_call("media_player", "media_play", {"entity_id": self.entity_id}, blocking=False)
+            _LOGGER.info("[%s][prev] Try to group", self.entity_id)
+            await self._try_group_or_play()
 
     async def _handle_stop(self):
-        # 1. Récupération de l'état actuel pour vérifier le groupement
         state = self.hass.states.get(self.entity_id)
         group_members = state.attributes.get("group_members", []) if state else []
 
-        # 2. Condition : Si l'enceinte fait partie d'un groupe (plus de 1 membre)
         if len(group_members) > 1:
             _LOGGER.info("[%s][stop] Enceinte groupée (%d membres) -> Dégroupage uniquement", self.entity_id, len(group_members))
             try:
@@ -286,8 +239,6 @@ class SonosKnxController:
                 )
             except Exception as err:
                 _LOGGER.error("[%s][stop] Échec unjoin : %s", self.entity_id, err)
-
-        # 3. Condition : L'enceinte est isolée -> Arrêt de la lecture
         else:
             _LOGGER.info("[%s][stop] Enceinte isolée -> Stop de la lecture", self.entity_id)
             try:
@@ -303,11 +254,9 @@ class SonosKnxController:
     def _get_active_player(self) -> str | None:
         """Trouve la première enceinte (hors nous-mêmes) qui est en cours de lecture."""
         for state in self.hass.states.async_all("media_player"):
-            # Exclure notre propre enceinte
             if state.entity_id == self.entity_id:
                 continue
             
-            # Vérifier si c'est une enceinte Sonos ou compatible et qu'elle joue
             if state.state == STATE_PLAYING:
                 _LOGGER.debug("[%s] Lecteur actif trouvé : %s", self.entity_id, state.entity_id)
                 return state.entity_id
@@ -319,7 +268,6 @@ class SonosKnxController:
         other_player = self._get_active_player()
         _LOGGER.info("[%s][group_or_play] active_player: %s", self.entity_id, other_player)
 
-        # 1. Option A : Regroupement si une enceinte est déjà active
         if other_player:
             _LOGGER.info("[%s][group_or_play] Regroupement avec %s", self.entity_id, other_player)
             try:
@@ -336,7 +284,6 @@ class SonosKnxController:
             except Exception as err:
                 _LOGGER.error("[%s][group_or_play] Échec du regroupement, lancement local : %s", self.entity_id, err)
 
-        # 2. Option B : Aucun lecteur actif, on lance le média/favori spécifié
         _LOGGER.info("[%s][group_or_play] start alone", self.entity_id)
         await self.hass.services.async_call("media_player", "media_play", {"entity_id": self.entity_id}, blocking=False)
 
@@ -376,8 +323,6 @@ class SonosKnxController:
         media_id = self.data.get(playlist_key)
         await self._play_media(media_id, "playlist")
 
-    import re
-
     async def _play_media(self, media_id: str, media_type: str):
         if not media_id:
             _LOGGER.warning("[%s] Aucun Favori ou ID média configuré", self.entity_id)
@@ -385,7 +330,6 @@ class SonosKnxController:
 
         target_source = str(media_id).strip()
 
-        # 1. Réglage du volume par défaut
         vol_level = float(self.data.get(CONF_DEFAULT_VOLUME, 0.2))
         try:
             await self.hass.services.async_call(
@@ -397,7 +341,6 @@ class SonosKnxController:
         except Exception as err:
             _LOGGER.error("[%s] Erreur lors du réglage du volume : %s", self.entity_id, err)
 
-        # 2. Lancement du Favori via select_source
         _LOGGER.info("[%s] Lancement du Favori Sonos : %s", self.entity_id, target_source)
         try:
             await self.hass.services.async_call(
